@@ -31,6 +31,13 @@ struct SimulationParams {
     int gridDepth;
     int numCells;
 
+    int isRepulsorActive;
+    float origin_x;
+    float origin_y;
+    float origin_z;
+    float dir_x;
+    float dir_y;
+    float dir_z;
 };
 
 
@@ -40,10 +47,14 @@ public:
     SimulationGPU(int numBoids, float width, float height, float depth);
     ~SimulationGPU();
 
-    void update(float deltaTime);
+    void update(float deltaTime) override;
+
+    SimulationParams& getParamsRef() { return m_hostParams; }
+    void updateParamsOnGPU();
+
+    void setInteractionData(bool active, float origin_x, float origin_y, float origin_z, float dir_x, float dir_y, float dir_z) override;
 
     void registerVBOs(unsigned int VBO_PosX, unsigned int VBO_PosY, unsigned int VBO_PosZ, unsigned int VBO_VelX, unsigned int VBO_VelY, unsigned int VBO_VelZ);
-
     void unregisterVBOs();
 
 private:
@@ -52,6 +63,10 @@ private:
     void reorderDataOnGPU();
     void findStartEndOnGPU();
 
+    void applyTurnFactor(float pos_x, float pos_y, float pos_z, float& vel_x, float& vel_y, float& vel_z);
+    void applySpeedLimits(float& vel_x, float& vel_y, float& vel_z);
+    void applyRepulsion(float pos_x, float pos_y, float pos_z, float& vel_x, float& vel_y, float& vel_z);
+    
     float *d_posX, *d_posY, *d_posZ;
     float *d_velX, *d_velY, *d_velZ;
     float *d_sortedPosX, *d_sortedPosY, *d_sortedPosZ;

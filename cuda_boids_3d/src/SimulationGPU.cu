@@ -1,4 +1,4 @@
-#include <glad/glad.h> 
+﻿#include <glad/glad.h> 
 
 #include "SimulationGPU.h"
 #include <cuda_runtime.h>
@@ -37,7 +37,7 @@ void checkLastError(const char* const file, const int line)
 #define M_PI 3.14159265358979323846f
 #endif
 
-constexpr int BLOCK_SIZE = 256;
+constexpr int BLOCK_SIZE = 512;
 __constant__ SimulationParams c_params;
 
 __global__ void initBoidsKernel(float* pX, float* pY, float* pZ, float* vX, float* vY, float* vZ, unsigned long long seed) 
@@ -127,6 +127,72 @@ __global__ void findStartEndKernel(const int* __restrict__ gridHash, int* cellSt
         cellEnd[myHash] = i + 1;
     }
 }
+__device__ void applyTurnFactor(float pos_x, float pos_y, float pos_z, float& vel_x, float& vel_y, float& vel_z) {
+    if (pos_x < c_params.margin) vel_x += c_params.turnFactor;
+    if (pos_x > c_params.width - c_params.margin) vel_x -= c_params.turnFactor;
+    if (pos_y < c_params.margin) vel_y += c_params.turnFactor;
+    if (pos_y > c_params.height - c_params.margin) vel_y -= c_params.turnFactor;
+    if (pos_z < c_params.margin) vel_z += c_params.turnFactor;
+    if (pos_z > c_params.depth - c_params.margin) vel_z -= c_params.turnFactor;
+}
+__device__ void applyRepulsion(float pos_x, float pos_y, float pos_z, float& vel_x, float& vel_y, float& vel_z)
+{
+    if (!c_params.isRepulsorActive) return;
+
+    const float beamRadius = 150.0f;
+    const float repulsionStrength = 200.0f;
+
+    float toBoidX = pos_x - c_params.origin_x;
+    float toBoidY = pos_y - c_params.origin_y;
+    float toBoidZ = pos_z - c_params.origin_z;
+
+    float t = toBoidX * c_params.dir_x + toBoidY * c_params.dir_y + toBoidZ * c_params.dir_z;
+
+    if (t > 0.0f)
+    {
+        float closeX = c_params.origin_x + t * c_params.dir_x;
+        float closeY = c_params.origin_y + t * c_params.dir_y;
+        float closeZ = c_params.origin_z + t * c_params.dir_z;
+
+        float perpX = pos_x - closeX;
+        float perpY = pos_y - closeY;
+        float perpZ = pos_z - closeZ;
+
+        float distSq = perpX * perpX + perpY * perpY + perpZ * perpZ;
+
+        if (distSq < beamRadius * beamRadius)
+        {
+            float dist = sqrtf(distSq);
+            if (dist > 0.001f)
+            {
+                float falloff = 1.0f - (dist / beamRadius);
+                float strength = (repulsionStrength * falloff) / dist;
+
+                vel_x += perpX * strength;
+                vel_y += perpY * strength;
+                vel_z += perpZ * strength;
+            }
+        }
+    }
+}
+__device__ void applySpeedLimits(float& vel_x, float& vel_y, float& vel_z)
+{
+    float speedSq = vel_x * vel_x + vel_y * vel_y + vel_z * vel_z;
+    if (speedSq > c_params.maxSpeed * c_params.maxSpeed) {
+        float s = sqrtf(speedSq);
+        vel_x = (vel_x / s) * c_params.maxSpeed;
+        vel_y = (vel_y / s) * c_params.maxSpeed;
+        vel_z = (vel_z / s) * c_params.maxSpeed;
+    }
+    else if (speedSq < c_params.minSpeed * c_params.minSpeed) {
+        float s = sqrtf(speedSq);
+        if (s > 0.0001f) {
+            vel_x = (vel_x / s) * c_params.minSpeed;
+            vel_y = (vel_y / s) * c_params.minSpeed;
+            vel_z = (vel_z / s) * c_params.minSpeed;
+        }
+    }
+}
 
 __global__ void updateGridBoidsKernel(const float* __restrict__ pX, const float* __restrict__ pY, const float* __restrict__ pZ,
     const float* __restrict__ vX, const float* __restrict__ vY, const float* __restrict__ vZ,
@@ -148,37 +214,40 @@ __global__ void updateGridBoidsKernel(const float* __restrict__ pX, const float*
     float vel_z = vZ[i];
 
     float close_dx = 0.0f, close_dy = 0.0f, close_dz = 0.0f;
-    float xvel_avg = 0.0f, yvel_avg = 0.0f, zvel_avg = 0.0f;
-    float xpos_avg = 0.0f, ypos_avg = 0.0f, zpos_avg = 0.0f;
-    float neighbors = 0.0f;
+    float pos_x_avg = 0.0f, pos_y_avg = 0.0f, pos_z_avg = 0.0f;
+    float vel_x_avg = 0.0f, vel_y_avg = 0.0f, vel_z_avg = 0.0f;
+    float neighbors_count = 0.0f;
 
-    int gridX = (int)(pos_x / c_params.cellSize);
-    int gridY = (int)(pos_y / c_params.cellSize);
-    int gridZ = (int)(pos_z / c_params.cellSize);
+    int grid_x = (int)(pos_x / c_params.cellSize);
+    int grid_y = (int)(pos_y / c_params.cellSize);
+    int grid_z = (int)(pos_z / c_params.cellSize);
     for (int z = -1; z <= 1; z++)
+    {
         for (int y = -1; y <= 1; y++)
+        {
             for (int x = -1; x <= 1; x++)
             {
-                int neighborX = gridX + x;
-                int neighborY = gridY + y;
-                int neighborZ = gridZ + z;
+                int neighbor_x = grid_x + x;
+                int neighbor_y = grid_y + y;
+                int neighbor_z = grid_z + z;
 
-                if (neighborX < 0 || neighborX >= c_params.gridWidth || neighborY < 0 || neighborY >= c_params.gridHeight || neighborZ < 0 || neighborZ >= c_params.gridDepth) continue;
+                if (neighbor_x < 0 || neighbor_x >= c_params.gridWidth ||
+                    neighbor_y < 0 || neighbor_y >= c_params.gridHeight ||
+                    neighbor_z < 0 || neighbor_z >= c_params.gridDepth) continue;
 
-                int cellID = (neighborZ * c_params.gridHeight * c_params.gridWidth) + (neighborY * c_params.gridWidth) + neighborX;
+                int cell_id = (neighbor_z * c_params.gridHeight * c_params.gridWidth) + (neighbor_y * c_params.gridWidth) + neighbor_x;
+                int start_id = cellStart[cell_id];
 
-                int startIndex = cellStart[cellID];
+                if (start_id == -1) continue;
+                int end_id = cellEnd[cell_id];
 
-                if (startIndex == -1) continue;
-                int endIndex = cellEnd[cellID];
-
-                for (int j = startIndex; j < endIndex; j++)
+                for (int k = start_id; k < end_id; k++)
                 {
-                    if (i == j) continue;
+                    if (i == k) continue;
 
-                    float other_px = pX[j];
-                    float other_py = pY[j];
-                    float other_pz = pZ[j];
+                    float other_px = pX[k];
+                    float other_py = pY[k];
+                    float other_pz = pZ[k];
 
                     float dx = pos_x - other_px;
                     float dy = pos_y - other_py;
@@ -196,64 +265,48 @@ __global__ void updateGridBoidsKernel(const float* __restrict__ pX, const float*
                         }
                         else
                         {
-                            xvel_avg += vX[j];
-                            yvel_avg += vY[j];
-                            zvel_avg += vZ[j];
-                            xpos_avg += other_px;
-                            ypos_avg += other_py;
-                            zpos_avg += other_pz;
-                            neighbors += 1.0f;
+                            vel_x_avg += vX[k];
+                            vel_y_avg += vY[k];
+                            vel_z_avg += vZ[k];
+
+                            pos_x_avg += other_px;
+                            pos_y_avg += other_py;
+                            pos_z_avg += other_pz;
+
+                            neighbors_count += 1.0f;
                         }
                     }
                 }
             }
+        }
+    }
 
-    if(neighbors > 0.0f) {
-        xvel_avg /= neighbors;
-        yvel_avg /= neighbors;
-        zvel_avg /= neighbors;
+    if(neighbors_count > 0.0f) {
+        vel_x_avg /= neighbors_count;
+        vel_y_avg /= neighbors_count;
+        vel_z_avg /= neighbors_count;
 
-        xpos_avg /= neighbors;
-        ypos_avg /= neighbors;
-        zpos_avg /= neighbors;
+        pos_x_avg /= neighbors_count;
+        pos_y_avg /= neighbors_count;
+        pos_z_avg /= neighbors_count;
 
-        vel_x += (xvel_avg - vel_x) * c_params.matchingFactor;
-        vel_y += (yvel_avg - vel_y) * c_params.matchingFactor;
-        vel_z += (zvel_avg - vel_z) * c_params.matchingFactor;
+        vel_x += (vel_x_avg - vel_x) * c_params.matchingFactor;
+        vel_y += (vel_y_avg - vel_y) * c_params.matchingFactor;
+        vel_z += (vel_z_avg - vel_z) * c_params.matchingFactor;
 
-        vel_x += (xpos_avg - pos_x) * c_params.centeringFactor;
-        vel_y += (ypos_avg - pos_y) * c_params.centeringFactor;
-        vel_z += (zpos_avg - pos_z) * c_params.centeringFactor;
+        vel_x += (pos_x_avg - pos_x) * c_params.centeringFactor;
+        vel_y += (pos_y_avg - pos_y) * c_params.centeringFactor;
+        vel_z += (pos_z_avg - pos_z) * c_params.centeringFactor;
 
     }
 
     vel_x += close_dx * c_params.avoidFactor;
     vel_y += close_dy * c_params.avoidFactor;
     vel_z += close_dz * c_params.avoidFactor;
-
-
-    if (pos_x < c_params.margin) vel_x += c_params.turnFactor;
-    if (pos_x > c_params.width - c_params.margin) vel_x -= c_params.turnFactor;
-    if (pos_y < c_params.margin) vel_y += c_params.turnFactor;
-    if (pos_y > c_params.height - c_params.margin) vel_y -= c_params.turnFactor;
-    if (pos_z < c_params.margin) vel_z += c_params.turnFactor;
-    if (pos_z > c_params.depth - c_params.margin) vel_z -= c_params.turnFactor;
-
-    float speedSq = vel_x * vel_x + vel_y * vel_y + vel_z * vel_z;
-    if (speedSq > c_params.maxSpeed * c_params.maxSpeed) {
-        float s = sqrtf(speedSq);
-        vel_x = (vel_x / s) * c_params.maxSpeed;
-        vel_y = (vel_y / s) * c_params.maxSpeed;
-        vel_z = (vel_z / s) * c_params.maxSpeed;
-    }
-    else if (speedSq < c_params.minSpeed * c_params.minSpeed) {
-        float s = sqrtf(speedSq);
-        if (s > 0.0001f) {
-            vel_x = (vel_x / s) * c_params.minSpeed;
-            vel_y = (vel_y / s) * c_params.minSpeed;
-            vel_z = (vel_z / s) * c_params.minSpeed;
-        }
-    }
+    
+    applyTurnFactor(pos_x, pos_y, pos_z, vel_x, vel_y, vel_z);
+    applySpeedLimits(vel_x, vel_y, vel_z);
+    applyRepulsion(pos_x, pos_y, pos_z, vel_x, vel_y, vel_z);
 
     outPx[i] = pos_x + vel_x * dt;
     outPy[i] = pos_y + vel_y * dt;
@@ -263,6 +316,8 @@ __global__ void updateGridBoidsKernel(const float* __restrict__ pX, const float*
     outVy[i] = vel_y;
     outVz[i] = vel_z;
 }
+
+
 SimulationGPU::SimulationGPU(int numBoids, float width, float height, float depth)
 {
     m_hostParams.numBoids = numBoids;
@@ -278,13 +333,13 @@ SimulationGPU::SimulationGPU(int numBoids, float width, float height, float dept
     m_hostParams.visualRangeSq = m_hostParams.visualRange * m_hostParams.visualRange;
     m_hostParams.protectedRangeSq = m_hostParams.protectedRange * m_hostParams.protectedRange;
 
-    m_hostParams.maxSpeed = 6.0f;
-    m_hostParams.minSpeed = 3.0f;
+    m_hostParams.maxSpeed = 25.0f;
+    m_hostParams.minSpeed = 10.0f;
 
-    m_hostParams.centeringFactor = 0.0005f;
+    m_hostParams.centeringFactor = 0.005f;
     m_hostParams.avoidFactor = 0.05f;
-    m_hostParams.matchingFactor = 0.05f;
-    m_hostParams.turnFactor = 0.02f;
+    m_hostParams.matchingFactor = 0.1f;
+    m_hostParams.turnFactor = 5.0f;
 
     m_hostParams.cellSize = m_hostParams.visualRange;
     m_hostParams.gridWidth = (int)(ceil(width / m_hostParams.cellSize));
@@ -321,7 +376,7 @@ SimulationGPU::SimulationGPU(int numBoids, float width, float height, float dept
     HANDLE_ERROR(cudaMalloc(&d_cellEnd, sizeCells));
 
 
-    HANDLE_ERROR(cudaMemcpyToSymbol(c_params, &m_hostParams, sizeof(SimulationParams)));
+    updateParamsOnGPU();
 
     initRandomBoidsOnGPU();
 
@@ -433,6 +488,25 @@ void SimulationGPU::update(float deltaTime) {
         HANDLE_ERROR(cudaGraphicsUnmapResources(1, &res_vboVelZ, 0));
 
     }
+}
+
+void SimulationGPU::updateParamsOnGPU() {
+    HANDLE_ERROR(cudaMemcpyToSymbol(c_params, &m_hostParams, sizeof(SimulationParams)));
+}
+
+void SimulationGPU::setInteractionData(bool active, float origin_x, float origin_y, float origin_z, float dir_x, float dir_y, float dir_z)
+{
+    m_hostParams.isRepulsorActive = active ? 1 : 0;
+
+    m_hostParams.origin_x = origin_x;
+    m_hostParams.origin_y = origin_y;
+    m_hostParams.origin_z = origin_z;
+
+    m_hostParams.dir_x = dir_x;
+    m_hostParams.dir_y = dir_y;
+    m_hostParams.dir_z = dir_z;
+
+    updateParamsOnGPU();
 }
 
 void SimulationGPU::registerVBOs(unsigned int VBO_PosX, unsigned int VBO_PosY, unsigned int VBO_PosZ, unsigned int VBO_VelX, unsigned int VBO_VelY, unsigned int VBO_VelZ)
