@@ -11,6 +11,8 @@ layout (location = 4) in float ivX;
 layout (location = 5) in float ivY;
 layout (location = 6) in float ivZ;
 
+layout (location = 8) in int aType;
+
 uniform mat4 view;
 uniform mat4 projection;
 
@@ -37,16 +39,28 @@ void main()
     mat4 translation = mat4(1.0);
     translation[3] = vec4(Pos, 1.0);
 
-    gl_Position = projection * view * translation * rotation * vec4(aPos, 1.0);
+    mat4 scale = mat4(1.0);
+    if (aType == 1) {
+        scale[0][0] = 4.0; 
+        scale[1][1] = 4.0; 
+        scale[2][2] = 4.0;
+    }
+
+    gl_Position = projection * view * translation * rotation * scale * vec4(aPos, 1.0);
 
     vec3 Normal = normalize(mat3(rotation) * aNormal);
     vec3 LightDir = normalize(vec3(0.5, 1.0, 0.3));
     float diff = max(dot(Normal, LightDir), 0.0);
     float ambient = 0.3;
-
-    float speed = length(Vel);
-    float t = clamp((speed - 10.0) / 20.0, 0.0, 1.0);
-    vec3 baseColor = mix(vec3(0.0, 0.5, 1.0), vec3(0.2, 0.8, 1.0), t);
+    vec3 baseColor;
+    if (aType == 1) {
+        baseColor = vec3(0.9, 0.1, 0.1); 
+    } 
+    else {
+        float speed = length(Vel);
+        float t = clamp((speed - 10.0) / 20.0, 0.0, 1.0);
+        baseColor = mix(vec3(0.0, 0.5, 1.0), vec3(0.2, 0.8, 1.0), t);
+    }
     
     vColor = (ambient + diff) * baseColor;
 }

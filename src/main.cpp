@@ -7,32 +7,34 @@
 #include "SimulationCPU.h"
 #include "SimulationGPU.h"
 
-#include "imgui.h"
-#include "imgui_impl_glfw.h"
-#include "imgui_impl_opengl3.h"
+#include "imgui\imgui.h"
+#include "imgui\imgui_impl_glfw.h"
+#include "imgui\imgui_impl_opengl3.h"
 
 #include <iostream>
 #include <vector>
 #include <memory>
 #include <string>
 #include <cmath>
+#include <chrono>
 
 enum class SimulationMode {
     CPU,
     GPU
 };
 
-const SimulationMode CURRENT_MODE = SimulationMode::CPU;
+// CONFIG PARAMETERS
+SimulationMode CURRENT_MODE = SimulationMode::GPU; // CHANGE FOR GPU / CPU
 const unsigned int SCR_WIDTH = 1280;
 const unsigned int SCR_HEIGHT = 720;
 
-const int BOIDS = 20000;
+int BOIDS = 10000;
 
 const float WORLD_HEIGHT = 2000.0f;
 const float WORLD_WIDTH = 2000.0f;
 const float WORLD_DEPTH = 2000.0f;
 
-// --- KAMERA 3D ---
+// CAMERA PARAMETERS
 glm::vec3 cameraPos = glm::vec3(SCR_WIDTH / 2, SCR_HEIGHT / 2, 1200.0f);
 glm::vec3 cameraFront = glm::vec3(0.0f, 0.0f, -1.0f);
 glm::vec3 cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
@@ -59,6 +61,8 @@ struct RenderContext {
     unsigned int VBO_VelX;
     unsigned int VBO_VelY;
     unsigned int VBO_VelZ;
+
+    unsigned int VBO_type;
 };
 
 unsigned int boxVAO = 0, boxVBO = 0;
@@ -84,8 +88,41 @@ void drawBox(const glm::mat4& view, const glm::mat4& proj, Shader& shader);
 void clearScreen();
 
 void renderScene(const RenderContext& ctx, const Shader& shader, const glm::mat4& view, const glm::mat4& proj);
-int main()
+int main(int argc, char* argv[])
 {
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+
+        if (arg == "-mode" && i + 1 < argc) {
+            std::string modeStr = argv[i + 1];
+            if (modeStr == "CPU") {
+                CURRENT_MODE = SimulationMode::CPU;
+            }
+            else if (modeStr == "GPU") {
+                CURRENT_MODE = SimulationMode::GPU;
+            }
+            else {
+                std::cout << "Warning: Unknown mode '" << modeStr << "'. Using default (GPU)." << std::endl;
+            }
+            i++;
+        }
+        else if (arg == "-n" && i + 1 < argc) {
+            try {
+                BOIDS = std::stoi(argv[i + 1]);
+                if (BOIDS < 0) BOIDS = 100;
+            }
+            catch (...) {
+                std::cout << "Warning: Invalid number for -n. Using default (10000)." << std::endl;
+            }
+            i++;
+        }
+    }
+
+    std::cout << "--- SIMULATION CONFIG ---" << std::endl;
+    std::cout << "Mode: " << (CURRENT_MODE == SimulationMode::GPU ? "GPU" : "CPU") << std::endl;
+    std::cout << "Boids: " << BOIDS << std::endl;
+    std::cout << "-------------------------" << std::endl;
+
     // GLFW
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -135,6 +172,7 @@ int main()
     setupRendering3D(ctx);
     setupBox();
 
+    // Get simulation pointer
     switch (CURRENT_MODE)
     {
         case SimulationMode::CPU:
@@ -144,15 +182,13 @@ int main()
             simPtr = std::make_unique<SimulationGPU>(BOIDS, WORLD_WIDTH, WORLD_HEIGHT, WORLD_DEPTH);
             dynamic_cast<SimulationGPU*>(simPtr.get())->registerVBOs(
                 ctx.VBO_PosX, ctx.VBO_PosY, ctx.VBO_PosZ,
-                ctx.VBO_VelX, ctx.VBO_VelY, ctx.VBO_VelZ
+                ctx.VBO_VelX, ctx.VBO_VelY, ctx.VBO_VelZ, ctx.VBO_type
             );
             break;
     }
 
     float deltaTime = 0.0f;
     float lastFrame = 0.0f;
-    double fpsLastTime = glfwGetTime();
-    int fpsNbFrames = 0;
 
     while (!glfwWindowShouldClose(window))
     {
@@ -188,17 +224,19 @@ int main()
         glfwPollEvents();
     }
 
-    // Sprzątanie
-    // Destruktory simGPU/simCPU wywołają się automatycznie
     glDeleteVertexArrays(1, &ctx.VAO);
-    glDeleteBuffers(1, &ctx.VBO_PosX); glDeleteBuffers(1, &ctx.VBO_PosY); glDeleteBuffers(1, &ctx.VBO_PosZ);
-    glDeleteBuffers(1, &ctx.VBO_VelX); glDeleteBuffers(1, &ctx.VBO_VelY); glDeleteBuffers(1, &ctx.VBO_VelZ);
+    glDeleteBuffers(1, &ctx.VBO_PosX); 
+    glDeleteBuffers(1, &ctx.VBO_PosY); 
+    glDeleteBuffers(1, &ctx.VBO_PosZ);
+    glDeleteBuffers(1, &ctx.VBO_VelX); 
+    glDeleteBuffers(1, &ctx.VBO_VelY); 
+    glDeleteBuffers(1, &ctx.VBO_VelZ);
+    glDeleteBuffers(1, &ctx.VBO_type);
 
     glfwTerminate();
     return 0;
 }
 
-// --- IMPLEMENTACJE ---
 
 void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
     glViewport(0, 0, width, height);
@@ -287,23 +325,20 @@ void processInput(GLFWwindow* window, float dt) {
 
 void setupRendering3D(RenderContext& ctx)
 {
+    // Boid Geometry
     float vertices[] = {
-        // Ściana 1 (Lewa-Góra) - patrzy w lewo i do góry
          0.0f,  10.0f,  0.0f,   -0.6f, 0.5f, 0.6f,
         -4.0f, -5.0f,  3.0f,    -0.6f, 0.5f, 0.6f,
          0.0f, -5.0f, -2.0f,    -0.6f, 0.5f, 0.6f,
 
-         // Ściana 2 (Prawa-Góra) - patrzy w prawo i do góry
           0.0f,  10.0f,  0.0f,    0.6f, 0.5f, 0.6f,
           0.0f, -5.0f, -2.0f,     0.6f, 0.5f, 0.6f,
           4.0f, -5.0f,  3.0f,     0.6f, 0.5f, 0.6f,
 
-          // Ściana 3 (Podstawa/Dół) - patrzy w dół i lekko w przód
-           0.0f,  10.0f,  0.0f,    0.0f, 0.2f, 0.9f, // Dziób lekko zaokrąglony
+           0.0f,  10.0f,  0.0f,    0.0f, 0.2f, 0.9f,
            4.0f, -5.0f,  3.0f,     0.0f, -0.8f, 0.6f,
           -4.0f, -5.0f,  3.0f,     0.0f, -0.8f, 0.6f,
 
-          // Ściana 4 (Tył) - patrzy w tył (-Z) i lekko w dół
           -4.0f, -5.0f,  3.0f,     0.0f, -0.5f, -0.8f,
            4.0f, -5.0f,  3.0f,     0.0f, -0.5f, -0.8f,
            0.0f, -5.0f, -2.0f,     0.0f, -0.5f, -0.8f
@@ -319,6 +354,7 @@ void setupRendering3D(RenderContext& ctx)
     glGenBuffers(1, &ctx.VBO_VelX); 
     glGenBuffers(1, &ctx.VBO_VelY); 
     glGenBuffers(1, &ctx.VBO_VelZ);
+    glGenBuffers(1, &ctx.VBO_type);
 
     glBindVertexArray(ctx.VAO);
 
@@ -347,6 +383,12 @@ void setupRendering3D(RenderContext& ctx)
     setupAttrib(ctx.VBO_VelY, 5);
     setupAttrib(ctx.VBO_VelZ, 6);
 
+    glBindBuffer(GL_ARRAY_BUFFER, ctx.VBO_type);
+    glBufferData(GL_ARRAY_BUFFER, BOIDS * sizeof(int), NULL, GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(8); 
+    glVertexAttribIPointer(8, 1, GL_INT, 0, (void*)0);
+    glVertexAttribDivisor(8, 1);
+
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
@@ -358,7 +400,20 @@ void renderUI(const std::unique_ptr<ISimulation>& simPtr) {
     ImGui::Begin("Simulation Settings");
     ImGui::Text("Mode: %s", CURRENT_MODE == SimulationMode::GPU ? "GPU" : "CPU");
     ImGui::Text("Number od boids: %d", BOIDS);
+
+    SimulationStats stats = simPtr->getStats();
+
     ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+    ImGui::Text("Frame Time: %.3f ms", 1000.0f / ImGui::GetIO().Framerate);
+    ImGui::Separator();
+
+    ImGui::Text("Performance Breakdown:");
+    ImGui::Text("Initialization (One-time): %.3f ms", stats.timeInit);
+    ImGui::Text("Data Copy/Map:             %.3f ms", stats.timeCopy);
+    ImGui::Text("Grid Sort/Hash:            %.3f ms", stats.timeSort);
+    ImGui::Text("Physics Calculation:       %.3f ms", stats.timeUpdate);
+    ImGui::Separator();
+    ImGui::Text("Total Simulation Step:     %.3f ms", stats.timeTotal);
     ImGui::Separator();
 
     bool changed = false;
@@ -368,10 +423,12 @@ void renderUI(const std::unique_ptr<ISimulation>& simPtr) {
             auto simGPU = dynamic_cast<SimulationGPU*>(simPtr.get());
             if (!simGPU) break;
             auto& p = simGPU->getParamsRef();
+            changed |= ImGui::SliderFloat("Visual Range", &p.visualRange, 20.0f, 100.0f);
+            changed |= ImGui::SliderFloat("Shark Detection Range Multiplier", &p.predatorDetectionMultiplier, 0.0f, 4.0f);
             changed |= ImGui::SliderFloat("Min Speed", &p.minSpeed, 1.0f, 50.0f);
             changed |= ImGui::SliderFloat("Max Speed", &p.maxSpeed, 1.0f, 50.0f);
-            changed |= ImGui::SliderFloat("Turn Factor", &p.turnFactor, 0.1f, 10.0f);
-            changed |= ImGui::SliderFloat("Cohesion", &p.centeringFactor, 0.0f, 0.01f, "%.5f");
+            changed |= ImGui::SliderFloat("Turn Factor", &p.turnFactor, 0.0f, 10.0f);
+            changed |= ImGui::SliderFloat("Cohesion", &p.centeringFactor, 0.0f, 1.0f);
             changed |= ImGui::SliderFloat("Alignment", &p.matchingFactor, 0.0f, 1.0f);
             changed |= ImGui::SliderFloat("Separation", &p.avoidFactor, 0.0f, 1.0f);
             if (changed)
@@ -381,12 +438,14 @@ void renderUI(const std::unique_ptr<ISimulation>& simPtr) {
         case SimulationMode::CPU:
         {
             auto simCPU = dynamic_cast<SimulationCPU*>(simPtr.get());
-            changed |= ImGui::SliderFloat("Min Speed", &simCPU->minSpeed, 1.0f, 50.0f);
-            changed |= ImGui::SliderFloat("Max Speed", &simCPU->maxSpeed, 1.0f, 50.0f);
-            changed |= ImGui::SliderFloat("Turn Factor", &simCPU->turnFactor, 0.1f, 10.0f);
-            changed |= ImGui::SliderFloat("Cohesion", &simCPU->centeringFactor, 0.0f, 0.01f, "%.5f");
-            changed |= ImGui::SliderFloat("Alignment", &simCPU->matchingFactor, 0.0f, 1.0f);
-            changed |= ImGui::SliderFloat("Separation", &simCPU->avoidFactor, 0.0f, 1.0f);
+            ImGui::SliderFloat("Min Speed", &simCPU->minSpeed, 1.0f, 50.0f);
+            ImGui::SliderFloat("Max Speed", &simCPU->maxSpeed, 1.0f, 50.0f);
+            ImGui::SliderFloat("Turn Factor", &simCPU->turnFactor, 0.1f, 10.0f);
+            ImGui::SliderFloat("Cohesion", &simCPU->centeringFactor, 0.0f, 0.01f, "%.5f");
+            ImGui::SliderFloat("Alignment", &simCPU->matchingFactor, 0.0f, 1.0f);
+            ImGui::SliderFloat("Separation", &simCPU->avoidFactor, 0.0f, 1.0f);
+            ImGui::SliderFloat("Repulsion", &simCPU->repulsionStrength, 0.0f, 500.0f);
+
             break;
         }
             
@@ -399,6 +458,7 @@ void updateSimulation(const std::unique_ptr<ISimulation>& simPtr, float dt) {
 }
 
 void uploadCPUDataToGPU(const std::unique_ptr<ISimulation>& simPtr, const RenderContext& ctx) {
+
     auto cpuSim = dynamic_cast<SimulationCPU*>(simPtr.get());
     if (!cpuSim) return;
 
@@ -413,6 +473,10 @@ void uploadCPUDataToGPU(const std::unique_ptr<ISimulation>& simPtr, const Render
     upload(ctx.VBO_VelX, cpuSim->getVelX());
     upload(ctx.VBO_VelY, cpuSim->getVelY());
     upload(ctx.VBO_VelZ, cpuSim->getVelZ());
+
+    glBindBuffer(GL_ARRAY_BUFFER, ctx.VBO_type);
+    const std::vector<int>& types = cpuSim->getType();
+    glBufferSubData(GL_ARRAY_BUFFER, 0, types.size() * sizeof(int), types.data());
 }
 
 void renderScene(const RenderContext& ctx, const Shader& shader, const glm::mat4& view, const glm::mat4& proj) {
@@ -479,8 +543,6 @@ void drawBox(const glm::mat4& view, const glm::mat4& proj, Shader& shader) {
     glBindVertexArray(0);
 }
 
-
-
 void updateInteraction(GLFWwindow* window, const glm::mat4& view, const glm::mat4& proj, std::unique_ptr<ISimulation>& simPtr)
 {
     if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
@@ -491,7 +553,6 @@ void updateInteraction(GLFWwindow* window, const glm::mat4& view, const glm::mat
         return;
     }
 
-    // 2. Oblicz Ray-Casting (Myszka -> Świat 3D)
     double mouseX, mouseY;
     glfwGetCursorPos(window, &mouseX, &mouseY);
 
@@ -504,7 +565,7 @@ void updateInteraction(GLFWwindow* window, const glm::mat4& view, const glm::mat
     glm::vec3 ray_wor = glm::vec3(glm::inverse(view) * ray_eye);
 
     interactionDir = glm::normalize(ray_wor);
-    interactionOrigin = cameraPos; // "Wałek" wychodzi prosto z kamery
+    interactionOrigin = cameraPos;
 
     if (simPtr) {
         float o_x = interactionOrigin.x;
