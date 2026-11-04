@@ -72,11 +72,19 @@ private:
     float *d_sortedVelX, *d_sortedVelY, *d_sortedVelZ;
     int* d_sorted_type;
 
+    // Stable boid ids, reordered together with the boids
+    int* d_ids = nullptr;
+    int* d_sortedIds = nullptr;
+
     int* d_gridHash; 
     int* d_gridIndex;
 
-    int* d_cellStart;
-    int* d_cellEnd;
+    int* d_cellStart = nullptr;
+    int* d_cellEnd = nullptr;
+    int m_cellCapacity = 0;
+
+    bool m_initialized = false;
+    float m_simTime = 0.0f;
 
 
     cudaGraphicsResource* res_vboPosX = nullptr;
