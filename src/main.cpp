@@ -1,4 +1,4 @@
-﻿#include <glad/glad.h>
+#include <glad/glad.h>
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -7,9 +7,9 @@
 #include "SimulationCPU.h"
 #include "SimulationGPU.h"
 
-#include "imgui\imgui.h"
-#include "imgui\imgui_impl_glfw.h"
-#include "imgui\imgui_impl_opengl3.h"
+#include <imgui.h>
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_opengl3.h>
 
 #include <iostream>
 #include <vector>
@@ -109,7 +109,7 @@ int main(int argc, char* argv[])
         else if (arg == "-n" && i + 1 < argc) {
             try {
                 BOIDS = std::stoi(argv[i + 1]);
-                if (BOIDS < 0) BOIDS = 100;
+                if (BOIDS <= 0) BOIDS = 100;
             }
             catch (...) {
                 std::cout << "Warning: Invalid number for -n. Using default (10000)." << std::endl;
@@ -201,7 +201,10 @@ int main(int argc, char* argv[])
         clearScreen();
         renderUI(simPtr);
 
-        glm::mat4 proj = glm::perspective(glm::radians(fov), (float)SCR_WIDTH / SCR_HEIGHT, 0.1f, 5000.0f);
+        int fbWidth, fbHeight;
+        glfwGetFramebufferSize(window, &fbWidth, &fbHeight);
+        float aspect = fbHeight > 0 ? (float)fbWidth / fbHeight : (float)SCR_WIDTH / SCR_HEIGHT;
+        glm::mat4 proj = glm::perspective(glm::radians(fov), aspect, 0.1f, 5000.0f);
         glm::mat4 view = glm::lookAt(cameraPos, cameraPos + cameraFront, cameraUp);
 
         updateInteraction(window, view, proj, simPtr);
@@ -223,6 +226,9 @@ int main(int argc, char* argv[])
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
+
+    // Release the CUDA-OpenGL interop resources while the GL context and buffers still exist
+    simPtr.reset();
 
     glDeleteVertexArrays(1, &ctx.VAO);
     glDeleteBuffers(1, &ctx.VBO_PosX); 
@@ -399,7 +405,7 @@ void renderUI(const std::unique_ptr<ISimulation>& simPtr) {
     ImGui::NewFrame();
     ImGui::Begin("Simulation Settings");
     ImGui::Text("Mode: %s", CURRENT_MODE == SimulationMode::GPU ? "GPU" : "CPU");
-    ImGui::Text("Number od boids: %d", BOIDS);
+    ImGui::Text("Number of boids: %d", BOIDS);
 
     SimulationStats stats = simPtr->getStats();
 
@@ -556,8 +562,13 @@ void updateInteraction(GLFWwindow* window, const glm::mat4& view, const glm::mat
     double mouseX, mouseY;
     glfwGetCursorPos(window, &mouseX, &mouseY);
 
-    float x = (2.0f * (float)mouseX) / SCR_WIDTH - 1.0f;
-    float y = 1.0f - (2.0f * (float)mouseY) / SCR_HEIGHT;
+    // Use the current window size, the window can be resized
+    int winWidth, winHeight;
+    glfwGetWindowSize(window, &winWidth, &winHeight);
+    if (winWidth <= 0 || winHeight <= 0) return;
+
+    float x = (2.0f * (float)mouseX) / winWidth - 1.0f;
+    float y = 1.0f - (2.0f * (float)mouseY) / winHeight;
 
     glm::vec4 ray_clip = glm::vec4(x, y, -1.0, 1.0);
     glm::vec4 ray_eye = glm::inverse(proj) * ray_clip;

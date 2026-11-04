@@ -1,4 +1,4 @@
-﻿#include "SimulationCPU.h"
+#include "SimulationCPU.h"
 #include <cmath>
 #include <algorithm>
 #include <iostream>
@@ -44,7 +44,7 @@ SimulationCPU::SimulationCPU(int numBoids, float width, float height, float dept
     margin = 100.0f;
 
     maxSpeed = 25.0f;
-    minSpeed = 20.0f;
+    minSpeed = 10.0f; // same as the GPU version
     sharkMaxSpeed = maxSpeed * 2.0f;
 
     visualRangeSq = visualRange * visualRange;
@@ -201,9 +201,10 @@ void SimulationCPU::update(float dt)
             bool predator_detected = false;
             float pred_dx_sum = 0.0f, pred_dy_sum = 0.0f, pred_dz_sum = 0.0f;
 
-            int grid_x = (int)(pos_x / cellSize);
-            int grid_y = (int)(pos_y / cellSize);
-            int grid_z = (int)(pos_z / cellSize);
+            // Clamp like getCellID, so boids outside the box still search around their own cell
+            int grid_x = std::min(std::max((int)(pos_x / cellSize), 0), gridWidth - 1);
+            int grid_y = std::min(std::max((int)(pos_y / cellSize), 0), gridHeight - 1);
+            int grid_z = std::min(std::max((int)(pos_z / cellSize), 0), gridDepth - 1);
 
             // Search neighboring cells
             for (int z = -1; z <= 1; z++) {
@@ -259,12 +260,12 @@ void SimulationCPU::update(float dt)
                                         close_dz += dz;
                                     }
                                     else if (distSq < visualRangeSq) {
-                                        // Aligment
+                                        // Cohesion
                                         xpos_avg += other_px;
                                         ypos_avg += other_py;
                                         zpos_avg += other_pz;
 
-                                        // Cohesion
+                                        // Alignment
                                         xvel_avg += velX[otherIdx];
                                         yvel_avg += velY[otherIdx];
                                         zvel_avg += velZ[otherIdx];

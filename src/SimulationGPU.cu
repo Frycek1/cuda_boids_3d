@@ -1,10 +1,11 @@
-﻿#include <glad/glad.h> 
+#include <glad/glad.h> 
 
 #include "SimulationGPU.h"
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <cuda_gl_interop.h>
 #include <iostream>
+#include <utility>
 #include <cmath>
 #include <curand_kernel.h>
 #include <thrust/sort.h>
@@ -54,7 +55,7 @@ __device__ float3 getWanderTarget(int id, float time, float frequency) {
 }
 
 // Create fishes and sharks in random locations
-__global__ void initBoidsKernel(float* pX, float* pY, float* pZ, float* vX, float* vY, float* vZ, int* type, unsigned long long seed) 
+__global__ void initBoidsKernel(float* pX, float* pY, float* pZ, float* vX, float* vY, float* vZ, int* type, int* ids, unsigned long long seed) 
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= c_params.numBoids) return;
@@ -86,6 +87,7 @@ __global__ void initBoidsKernel(float* pX, float* pY, float* pZ, float* vX, floa
         myType = 0; // Fish
     }
     type[i] = myType;
+    ids[i] = i;
 
     float speed;
     if (myType == 1) {
@@ -127,10 +129,10 @@ __global__ void assignGridKernel(const float* __restrict__ pX, const float* __re
 __global__ void reorderDataKernel(const int* __restrict__ gridIndex,
     const float* __restrict__ oldX, const float* __restrict__ oldY, const float* __restrict__ oldZ,
     const float* __restrict__ oldVX, const float* __restrict__ oldVY, const float* __restrict__ oldVZ,
-    const int* __restrict__ old_types,
+    const int* __restrict__ old_types, const int* __restrict__ old_ids,
     float* sortedX, float* sortedY, float* sortedZ, 
     float* sortedVX, float* sortedVY, float* sortedVZ,
-    int* sorted_types) 
+    int* sorted_types, int* sorted_ids) 
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= c_params.numBoids) return;
@@ -144,6 +146,7 @@ __global__ void reorderDataKernel(const int* __restrict__ gridIndex,
     sortedVY[i] = oldVY[originalInd];
     sortedVZ[i] = oldVZ[originalInd];
     sorted_types[i] = old_types[originalInd];
+    sorted_ids[i] = old_ids[originalInd];
 }
 
 // Find start and end of each cell
@@ -234,6 +237,7 @@ __global__ void updateGridBoidsKernel(const float* __restrict__ pX, const float*
     const float* __restrict__ vX, const float* __restrict__ vY, const float* __restrict__ vZ,
     const int* __restrict__ cellStart, const int* __restrict__ cellEnd,
     const int* __restrict__ type,
+    const int* __restrict__ ids,
     float* outPx, float* outPy, float* outPz,
     float* outVx, float* outVy, float* outVz,
     float dt, float timeGlobal)
@@ -253,8 +257,8 @@ __global__ void updateGridBoidsKernel(const float* __restrict__ pX, const float*
 
     if (my_type == 1) // Shark logic
     {
-        // Random wander
-        float3 wanderTarget = getWanderTarget(i, timeGlobal, 0.5f);
+        // Random wander, seeded with the boid's stable id (i changes every frame after sorting)
+        float3 wanderTarget = getWanderTarget(ids[i], timeGlobal, 0.5f);
 
         float steerForce = 2 * c_params.sharkMaxSpeed;
 
@@ -274,9 +278,10 @@ __global__ void updateGridBoidsKernel(const float* __restrict__ pX, const float*
         bool predator_detected = false;
         float pred_dx_sum = 0.0f, pred_dy_sum = 0.0f, pred_dz_sum = 0.0f;
 
-        int grid_x = (int)(pos_x / c_params.cellSize);
-        int grid_y = (int)(pos_y / c_params.cellSize);
-        int grid_z = (int)(pos_z / c_params.cellSize);
+        // Clamp like assignGridKernel, so boids outside the box still search around their own cell
+        int grid_x = min(max((int)(pos_x / c_params.cellSize), 0), c_params.gridWidth - 1);
+        int grid_y = min(max((int)(pos_y / c_params.cellSize), 0), c_params.gridHeight - 1);
+        int grid_z = min(max((int)(pos_z / c_params.cellSize), 0), c_params.gridDepth - 1);
 
         // Search neighboring cells
         for (int z = -1; z <= 1; z++) {
@@ -325,13 +330,13 @@ __global__ void updateGridBoidsKernel(const float* __restrict__ pX, const float*
                                     close_dy += dy;
                                     close_dz += dz;
                                 }
-                                else {
-                                    // Aligment
+                                else if (distSq < c_params.visualRangeSq) {
+                                    // Cohesion
                                     xpos_avg += pX[k];
                                     ypos_avg += pY[k];
                                     zpos_avg += pZ[k];
 
-                                    // Cohesion
+                                    // Alignment
                                     xvel_avg += vX[k];
                                     yvel_avg += vY[k];
                                     zvel_avg += vZ[k];
@@ -435,15 +440,8 @@ SimulationGPU::SimulationGPU(int numBoids, float width, float height, float dept
     m_hostParams.matchingFactor = 0.1f;
     m_hostParams.turnFactor = 5.0f;
 
-    m_hostParams.cellSize = m_hostParams.visualRange;
-    m_hostParams.gridWidth = (int)(ceil(width / m_hostParams.cellSize));
-    m_hostParams.gridHeight = (int)(ceil(height / m_hostParams.cellSize));
-    m_hostParams.gridDepth = (int)(ceil(depth / m_hostParams.cellSize));
-
     m_hostParams.repulsionStrength = 200.0f;
     m_hostParams.isRepulsorActive = false;
-
-    m_hostParams.numCells = m_hostParams.gridWidth * m_hostParams.gridHeight * m_hostParams.gridDepth;
 
     size_t sizeFloat = numBoids * sizeof(float);
 
@@ -460,21 +458,20 @@ SimulationGPU::SimulationGPU(int numBoids, float width, float height, float dept
     HANDLE_ERROR(cudaMalloc(&d_gridHash, sizeInt));
     HANDLE_ERROR(cudaMalloc(&d_gridIndex, sizeInt));
     HANDLE_ERROR(cudaMalloc(&d_sorted_type, sizeInt));
+    HANDLE_ERROR(cudaMalloc(&d_ids, sizeInt));
+    HANDLE_ERROR(cudaMalloc(&d_sortedIds, sizeInt));
 
 
-    size_t sizeCells = m_hostParams.numCells * sizeof(int);
-    HANDLE_ERROR(cudaMalloc(&d_cellStart, sizeCells));
-    HANDLE_ERROR(cudaMalloc(&d_cellEnd, sizeCells));
-
+    // Grid and cell arrays are set up in updateParamsOnGPU()
     updateParamsOnGPU();
 }
 
 void SimulationGPU::update(float deltaTime) {
     float milliseconds = 0;
 
-    cudaEventRecord(startEvent);
-
     if (!res_vboPosX) return;
+
+    cudaEventRecord(startEvent);
     // Lock arrays poiners from openGL
     HANDLE_ERROR(cudaGraphicsMapResources(1, &res_vboPosX, 0));
     HANDLE_ERROR(cudaGraphicsMapResources(1, &res_vboPosY, 0));
@@ -504,13 +501,12 @@ void SimulationGPU::update(float deltaTime) {
     m_stats.timeCopy = milliseconds;
 
     // First update should initialize boids locations
-    static bool isInitialized = false;
-    if (!isInitialized) {
+    if (!m_initialized) {
         cudaEventRecord(startEvent);
         int blocks = (m_hostParams.numBoids + BLOCK_SIZE - 1) / BLOCK_SIZE;
         initBoidsKernel << <blocks, BLOCK_SIZE >> > (d_gl_posX, d_gl_posY, d_gl_posZ,
             d_gl_velX, d_gl_velY, d_gl_velZ,
-            d_gl_type, time(NULL));
+            d_gl_type, d_ids, time(NULL));
         CHECK_LAST_ERROR();
 
         cudaEventRecord(stopEvent);
@@ -520,7 +516,7 @@ void SimulationGPU::update(float deltaTime) {
         cudaEventElapsedTime(&initTime, startEvent, stopEvent);
         m_stats.timeInit = initTime;
 
-        isInitialized = true;
+        m_initialized = true;
     }
 
     cudaEventRecord(startEvent);
@@ -540,10 +536,10 @@ void SimulationGPU::update(float deltaTime) {
         d_gridIndex,
         d_gl_posX, d_gl_posY, d_gl_posZ, 
         d_gl_velX, d_gl_velY, d_gl_velZ,
-        d_gl_type,
+        d_gl_type, d_ids,
         d_sortedPosX, d_sortedPosY, d_sortedPosZ, 
         d_sortedVelX, d_sortedVelY, d_sortedVelZ, 
-        d_sorted_type
+        d_sorted_type, d_sortedIds
         );
     CHECK_LAST_ERROR();
 
@@ -558,8 +554,9 @@ void SimulationGPU::update(float deltaTime) {
     cudaEventElapsedTime(&milliseconds, startEvent, stopEvent);
     m_stats.timeSort = milliseconds;
 
-    // Time variable for sharks random movement
-    float timeGlobal = (float)clock() / CLOCKS_PER_SEC;
+    // Simulation time for the sharks' random movement (clock() measures CPU time, not elapsed time)
+    m_simTime += deltaTime;
+    float timeGlobal = m_simTime;
 
     cudaEventRecord(startEvent);
     // Run update
@@ -568,6 +565,7 @@ void SimulationGPU::update(float deltaTime) {
         d_sortedVelX, d_sortedVelY, d_sortedVelZ,
         d_cellStart, d_cellEnd,
         d_sorted_type,
+        d_sortedIds,
         d_gl_posX, d_gl_posY, d_gl_posZ,
         d_gl_velX, d_gl_velY, d_gl_velZ,
         deltaTime, timeGlobal
@@ -583,6 +581,8 @@ void SimulationGPU::update(float deltaTime) {
     cudaEventRecord(startEvent);
 
     HANDLE_ERROR(cudaMemcpy(d_gl_type, d_sorted_type, m_hostParams.numBoids * sizeof(int), cudaMemcpyDeviceToDevice));
+    // Output is now in sorted order, so the sorted ids become the current ids
+    std::swap(d_ids, d_sortedIds);
 
     // Unlock openGL pointers
     HANDLE_ERROR(cudaGraphicsUnmapResources(1, &res_vboPosX, 0));
@@ -622,6 +622,26 @@ void SimulationGPU::setInteractionData(bool active, float origin_x, float origin
 // Send new hostParams to GPU
 void SimulationGPU::updateParamsOnGPU() {
     m_hostParams.visualRangeSq = m_hostParams.visualRange * m_hostParams.visualRange;
+    m_hostParams.protectedRangeSq = m_hostParams.protectedRange * m_hostParams.protectedRange;
+
+    // The 3x3x3 neighbour search is only exact if a cell is at least as large as the
+    // biggest interaction radius (visual range and shark detection range).
+    // Rebuild the grid whenever these change, e.g. from the UI sliders.
+    float cellSize = fmaxf(m_hostParams.visualRange, m_hostParams.visualRange * m_hostParams.predatorDetectionMultiplier);
+    m_hostParams.cellSize = cellSize;
+    m_hostParams.gridWidth = (int)ceilf(m_hostParams.width / cellSize);
+    m_hostParams.gridHeight = (int)ceilf(m_hostParams.height / cellSize);
+    m_hostParams.gridDepth = (int)ceilf(m_hostParams.depth / cellSize);
+    m_hostParams.numCells = m_hostParams.gridWidth * m_hostParams.gridHeight * m_hostParams.gridDepth;
+
+    if (m_hostParams.numCells > m_cellCapacity) {
+        cudaFree(d_cellStart);
+        cudaFree(d_cellEnd);
+        HANDLE_ERROR(cudaMalloc(&d_cellStart, m_hostParams.numCells * sizeof(int)));
+        HANDLE_ERROR(cudaMalloc(&d_cellEnd, m_hostParams.numCells * sizeof(int)));
+        m_cellCapacity = m_hostParams.numCells;
+    }
+
     HANDLE_ERROR(cudaMemcpyToSymbol(c_params, &m_hostParams, sizeof(SimulationParams)));
 }
 
@@ -680,6 +700,8 @@ SimulationGPU::~SimulationGPU()
     cudaFree(d_cellEnd);
 
     cudaFree(d_sorted_type);
+    cudaFree(d_ids);
+    cudaFree(d_sortedIds);
 
     cudaEventDestroy(startEvent);
     cudaEventDestroy(stopEvent);
